@@ -1691,7 +1691,7 @@ make_relation_tle(Oid reloid, const char *relname, const char *column)
  * Returns number of nodes that returned correct statistics.
  */
 static int
-get_remote_relstat(char *nspname, char *relname, bool replicated,
+get_remote_relstat(char *nspname, char *relname, bool istemp, bool replicated,
 				   int32 *pages, int32 *allvisiblepages,
 				   float4 *tuples, TransactionId *frozenXid)
 {
@@ -1708,15 +1708,32 @@ get_remote_relstat(char *nspname, char *relname, bool replicated,
 
 	/* Make up query string */
 	initStringInfo(&query);
-	appendStringInfo(&query, "SELECT c.relpages, "
-									"c.reltuples, "
-									"c.relallvisible, "
-									"c.relfrozenxid "
-							 "FROM pg_class c JOIN pg_namespace n "
-							 "ON c.relnamespace = n.oid "
-							 "WHERE n.nspname = '%s' "
-							 "AND c.relname = '%s'",
-					 nspname, relname);
+
+	/*
+	 * For temporary tables, the namespace may be different on each node. So we
+	 * must not use the namespace from the coordinator. Instead,
+	 * pg_my_temp_schema() does the right thing of finding the correct
+	 * temporary namespace being used for the current session. We use that.
+	 */
+	if (istemp)
+		appendStringInfo(&query, "SELECT c.relpages, "
+				"c.reltuples, "
+				"c.relallvisible, "
+				"c.relfrozenxid "
+				"FROM pg_class c "
+				"WHERE c.relnamespace = pg_my_temp_schema() "
+				"AND c.relname = '%s'",
+				relname);
+	else
+		appendStringInfo(&query, "SELECT c.relpages, "
+				"c.reltuples, "
+				"c.relallvisible, "
+				"c.relfrozenxid "
+				"FROM pg_class c JOIN pg_namespace n "
+				"ON c.relnamespace = n.oid "
+				"WHERE n.nspname = '%s' "
+				"AND c.relname = '%s'",
+				nspname, relname);
 
 	/* Build up RemoteQuery */
 	step = makeNode(RemoteQuery);
@@ -1724,7 +1741,6 @@ get_remote_relstat(char *nspname, char *relname, bool replicated,
 	step->combine_type = COMBINE_TYPE_NONE;
 	step->exec_nodes = NULL;
 	step->sql_statement = query.data;
-	step->force_autocommit = true;
 	step->exec_type = EXEC_ON_DATANODES;
 
 	/* Add targetlist entries */
@@ -1864,19 +1880,19 @@ vacuum_rel_coordinator(Relation onerel, bool is_outer)
 	bool		hasindex;
 	bool 		replicated;
 	int 		rel_nodes;
+	bool		istemp;
 
 	/* Get the relation identifier */
 	relname = RelationGetRelationName(onerel);
 	nspname = get_namespace_name(RelationGetNamespace(onerel));
-
-	elog(LOG, "Getting relation statistics for %s.%s", nspname, relname);
+	istemp = (onerel->rd_rel->relpersistence == RELPERSISTENCE_TEMP);
 
 	replicated = IsLocatorReplicated(RelationGetLocatorType(onerel));
 	/*
 	 * Get stats from the remote nodes. Function returns the number of nodes
 	 * returning correct stats.
 	 */
-	rel_nodes = get_remote_relstat(nspname, relname, replicated,
+	rel_nodes = get_remote_relstat(nspname, relname, istemp, replicated,
 								   &num_pages, &num_allvisible_pages,
 								   &num_tuples, &min_frozenxid);
 	if (rel_nodes > 0)
@@ -1904,7 +1920,8 @@ vacuum_rel_coordinator(Relation onerel, bool is_outer)
 				relname = RelationGetRelationName(Irel[i]);
 				nspname = get_namespace_name(RelationGetNamespace(Irel[i]));
 				/* Index is replicated if parent relation is replicated */
-				idx_nodes = get_remote_relstat(nspname, relname, replicated,
+				idx_nodes = get_remote_relstat(nspname, relname, istemp,
+										replicated,
 										&idx_pages, &idx_allvisible_pages,
 										&idx_tuples, &idx_frozenxid);
 				if (idx_nodes > 0)

@@ -92,14 +92,12 @@
 
 static void ExecUtilityStmtOnNodes(const char *queryString, ExecNodes *nodes,
 								   bool sentToRemote,
-								   bool force_autocommit,
 								   RemoteQueryExecType exec_type,
 								   bool is_temp,
 								   bool add_context);
 static void ExecUtilityStmtOnNodesInternal(const char *queryString,
 								   ExecNodes *nodes,
 								   bool sentToRemote,
-								   bool force_autocommit,
 								   RemoteQueryExecType exec_type,
 								   bool is_temp);
 static RemoteQueryExecType ExecUtilityFindNodes(ObjectType objectType,
@@ -435,12 +433,11 @@ ProcessUtilityPre(PlannedStmt *pstmt,
 	bool		isTopLevel = (context == PROCESS_UTILITY_TOPLEVEL);
 	bool		all_done = false;
 	bool		is_temp = false;
-	bool		auto_commit = false;
 	bool		add_context = false;
 	RemoteQueryExecType	exec_type = EXEC_ON_NONE;
 
 	/*
-	 * auto_commit and is_temp is initialised to false and changed if required.
+	 * is_temp is initialised to false and changed if required.
 	 *
 	 * exec_type is initialised to EXEC_ON_NONE and updated iff the command
 	 * needs remote execution during the preprocessing step.
@@ -553,7 +550,7 @@ ProcessUtilityPre(PlannedStmt *pstmt,
 				/* Clean also remote Coordinators */
 				sprintf(query, "CLEAN CONNECTION TO ALL FOR DATABASE %s;",
 						quote_identifier(stmt->dbname));
-				ExecUtilityStmtOnNodes(query, NULL, sentToRemote, true,
+				ExecUtilityStmtOnNodes(query, NULL, sentToRemote,
 						EXEC_ON_ALL_NODES, false, false);
 			}
 			break;
@@ -579,7 +576,13 @@ ProcessUtilityPre(PlannedStmt *pstmt,
 				 */
 				if (!(stmt->options & VACOPT_COORDINATOR))
 					exec_type = EXEC_ON_DATANODES;
-				auto_commit = true;
+
+				if (IS_PGXC_LOCAL_COORDINATOR &&
+					!(stmt->options & VACOPT_COORDINATOR))
+				{
+					if (stmt->options & VACOPT_VACUUM)
+						SetRequireRemoteTransactionAutoCommit();
+				}
 			}
 			break;
 
@@ -714,7 +717,7 @@ ProcessUtilityPre(PlannedStmt *pstmt,
 			 * connections, then clean local pooler
 			 */
 			if (IS_PGXC_COORDINATOR)
-				ExecUtilityStmtOnNodes(queryString, NULL, sentToRemote, true,
+				ExecUtilityStmtOnNodes(queryString, NULL, sentToRemote,
 						EXEC_ON_ALL_NODES, false, false);
 			CleanConnection((CleanConnStmt *) parsetree);
 			break;
@@ -881,7 +884,7 @@ ProcessUtilityPre(PlannedStmt *pstmt,
 	 * Send queryString to remote nodes, if needed.
 	 */ 
 	if (IS_PGXC_LOCAL_COORDINATOR)
-		ExecUtilityStmtOnNodes(queryString, NULL, sentToRemote, auto_commit,
+		ExecUtilityStmtOnNodes(queryString, NULL, sentToRemote,
 				exec_type, is_temp, add_context);
 
 
@@ -897,12 +900,11 @@ ProcessUtilityPost(PlannedStmt *pstmt,
 {
 	Node	   *parsetree = pstmt->utilityStmt;
 	bool		is_temp = false;
-	bool		auto_commit = false;
 	bool		add_context = false;
 	RemoteQueryExecType	exec_type = EXEC_ON_NONE;
 
 	/*
-	 * auto_commit and is_temp is initialised to false and changed if required.
+	 * is_temp is initialised to false and changed if required.
 	 *
 	 * exec_type is initialised to EXEC_ON_NONE and updated iff the command
 	 * needs remote execution during the preprocessing step.
@@ -1061,8 +1063,12 @@ ProcessUtilityPost(PlannedStmt *pstmt,
 			break;
 
 		case T_ClusterStmt:
+			if (((ClusterStmt *) parsetree)->relation == NULL)
+				SetRequireRemoteTransactionAutoCommit();
+			exec_type = EXEC_ON_DATANODES;
+			break;
+
 		case T_CheckPointStmt:
-			auto_commit = true;
 			exec_type = EXEC_ON_DATANODES;
 			break;
 
@@ -1072,7 +1078,6 @@ ProcessUtilityPost(PlannedStmt *pstmt,
 			 * For example, temporary tables are created on all Datanodes
 			 * and Coordinators.
 			 */
-			auto_commit = true;
 			exec_type = EXEC_ON_ALL_NODES;
 			break;
 
@@ -1098,11 +1103,6 @@ ProcessUtilityPost(PlannedStmt *pstmt,
 						elog(ERROR, "unrecognized object type: %d",
 							 (int) stmt->kind);
 						break;
-				}
-				if (IS_PGXC_LOCAL_COORDINATOR)
-				{
-					auto_commit = (stmt->kind == REINDEX_OBJECT_DATABASE ||
-									   stmt->kind == REINDEX_OBJECT_SCHEMA);
 				}
 			}
 			break;
@@ -1213,7 +1213,6 @@ ProcessUtilityPost(PlannedStmt *pstmt,
 				else
 					exec_type = EXEC_ON_NONE;
 
-				auto_commit = stmt->concurrent;
 				if (stmt->isconstraint)
 					exec_type = EXEC_ON_NONE;
 			}
@@ -1320,7 +1319,7 @@ ProcessUtilityPost(PlannedStmt *pstmt,
 	}
 
 	if (IS_PGXC_LOCAL_COORDINATOR)
-		ExecUtilityStmtOnNodes(queryString, NULL, sentToRemote, auto_commit,
+		ExecUtilityStmtOnNodes(queryString, NULL, sentToRemote,
 				exec_type, is_temp, add_context);
 }
 /*
@@ -1535,7 +1534,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		case T_CreateTableSpaceStmt:
 			/* no event triggers for global objects */
 			if (IS_PGXC_LOCAL_COORDINATOR)
-				PreventTransactionChain(isTopLevel, "CREATE TABLESPACE");
+				PreventTransactionChainLocal(isTopLevel, "CREATE TABLESPACE");
 			CreateTableSpace((CreateTableSpaceStmt *) parsetree);
 			break;
 
@@ -1543,7 +1542,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			/* no event triggers for global objects */
 			/* Allow this to be run inside transaction block on remote nodes */
 			if (IS_PGXC_LOCAL_COORDINATOR)
-				PreventTransactionChain(isTopLevel, "DROP TABLESPACE");
+				PreventTransactionChainLocal(isTopLevel, "DROP TABLESPACE");
 
 			DropTableSpace((DropTableSpaceStmt *) parsetree);
 			break;
@@ -1595,7 +1594,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		case T_CreatedbStmt:
 			/* no event triggers for global objects */
 			if (IS_PGXC_LOCAL_COORDINATOR)
-				PreventTransactionChain(isTopLevel, "CREATE DATABASE");
+				PreventTransactionChainLocal(isTopLevel, "CREATE DATABASE");
 			createdb(pstate, (CreatedbStmt *) parsetree);
 			break;
 
@@ -1615,7 +1614,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 				/* no event triggers for global objects */
 				if (IS_PGXC_LOCAL_COORDINATOR)
-					PreventTransactionChain(isTopLevel, "DROP DATABASE");
+					PreventTransactionChainLocal(isTopLevel, "DROP DATABASE");
 
 				dropdb(stmt->dbname, stmt->missing_ok);
 			}
@@ -1667,6 +1666,8 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		case T_ClusterStmt:
 			/* we choose to allow this during "read only" transactions */
 			PreventCommandDuringRecovery("CLUSTER");
+			if (((ClusterStmt *) parsetree)->relation == NULL)
+				PreventTransactionChain(isTopLevel, "CLUSTER");
 			/* forbidden in parallel mode due to CommandIsReadOnly */
 			cluster((ClusterStmt *) parsetree, isTopLevel);
 			break;
@@ -1785,6 +1786,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		case T_ReindexStmt:
 			{
 				ReindexStmt *stmt = (ReindexStmt *) parsetree;
+				bool				prevent_xact_chain = false;
 
 				/* we choose to allow this during "read only" transactions */
 				PreventCommandDuringRecovery("REINDEX");
@@ -1812,11 +1814,17 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 												(stmt->kind == REINDEX_OBJECT_SYSTEM) ? "REINDEX SYSTEM" :
 												"REINDEX DATABASE");
 						ReindexMultipleTables(stmt->name, stmt->kind, stmt->options);
+						prevent_xact_chain = true;
 						break;
 					default:
 						elog(ERROR, "unrecognized object type: %d",
 							 (int) stmt->kind);
 						break;
+				}
+				if (IS_PGXC_LOCAL_COORDINATOR)
+				{
+					if (prevent_xact_chain)
+						SetRequireRemoteTransactionAutoCommit();
 				}
 			}
 			break;
@@ -1868,7 +1876,6 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 									   completionTag);
 				else
 					ExecRenameStmt(stmt);
-
 			}
 			break;
 
@@ -1929,7 +1936,6 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 									   completionTag);
 				else
 					CommentObject(stmt);
-				break;
 			}
 			break;
 
@@ -2824,12 +2830,17 @@ ExecDropStmt(DropStmt *stmt,
 ExecDropStmt(DropStmt *stmt, bool isTopLevel)
 #endif
 {
+	bool	prevent_xact_chain = false;
+
 	switch (stmt->removeType)
 	{
 		case OBJECT_INDEX:
 			if (stmt->concurrent)
+			{
 				PreventTransactionChain(isTopLevel,
 										"DROP INDEX CONCURRENTLY");
+				prevent_xact_chain = true;
+			}
 			/* fall through */
 
 		case OBJECT_TABLE:
@@ -2850,8 +2861,12 @@ ExecDropStmt(DropStmt *stmt, bool isTopLevel)
 #ifdef PGXC
 				/* DROP is done depending on the object type and its temporary type */
 				if (IS_PGXC_LOCAL_COORDINATOR)
-					ExecUtilityStmtOnNodes(queryString, NULL, sentToRemote, false,
+				{
+					if (prevent_xact_chain)
+						SetRequireRemoteTransactionAutoCommit();
+					ExecUtilityStmtOnNodes(queryString, NULL, sentToRemote,
 							exec_type, is_temp, false);
+				}
 			}
 #endif
 			break;
@@ -2868,7 +2883,7 @@ ExecDropStmt(DropStmt *stmt, bool isTopLevel)
 				RemoveObjects(stmt);
 #ifdef PGXC
 				if (IS_PGXC_LOCAL_COORDINATOR)
-					ExecUtilityStmtOnNodes(queryString, NULL, sentToRemote, false,
+					ExecUtilityStmtOnNodes(queryString, NULL, sentToRemote,
 							exec_type, is_temp, false);
 			}
 #endif
@@ -4608,7 +4623,7 @@ GetCommandLogLevel(Node *parsetree)
 #ifdef PGXC
 static void
 ExecUtilityStmtOnNodesInternal(const char *queryString, ExecNodes *nodes, bool sentToRemote,
-		bool force_autocommit, RemoteQueryExecType exec_type, bool is_temp)
+		RemoteQueryExecType exec_type, bool is_temp)
 {
 	/* Return if query is launched on no nodes */
 	if (exec_type == EXEC_ON_NONE)
@@ -4632,7 +4647,6 @@ ExecUtilityStmtOnNodesInternal(const char *queryString, ExecNodes *nodes, bool s
 		step->combine_type = COMBINE_TYPE_SAME;
 		step->exec_nodes = nodes;
 		step->sql_statement = pstrdup(queryString);
-		step->force_autocommit = force_autocommit;
 		step->exec_type = exec_type;
 		ExecRemoteUtility(step);
 		pfree(step->sql_statement);
@@ -4648,8 +4662,6 @@ ExecUtilityStmtOnNodesInternal(const char *queryString, ExecNodes *nodes, bool s
  * 
  *  queryString is the raw query to be executed.
  * 	If nodes is NULL then the list of nodes is computed from exec_type.
- * 	If auto_commit is true, then the query is executed without a transaction
- * 	  block and auto-committed on the remote node.
  * 	exec_type is used to compute the list of remote nodes on which the query is
  * 	  executed.
  * 	is_temp is set to true if the query involves a temporary database object.
@@ -4658,13 +4670,13 @@ ExecUtilityStmtOnNodesInternal(const char *queryString, ExecNodes *nodes, bool s
  */
 static void
 ExecUtilityStmtOnNodes(const char *queryString, ExecNodes *nodes,
-		bool sentToRemote, bool auto_commit, RemoteQueryExecType exec_type,
+		bool sentToRemote, RemoteQueryExecType exec_type,
 		bool is_temp, bool add_context)
 {
 	PG_TRY();
 	{
 		ExecUtilityStmtOnNodesInternal(queryString, nodes, sentToRemote,
-				auto_commit, exec_type, is_temp);
+				exec_type, is_temp);
 	}
 	PG_CATCH();
 	{
