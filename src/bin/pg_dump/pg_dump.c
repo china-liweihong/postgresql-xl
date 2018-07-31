@@ -15208,39 +15208,47 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
 #ifdef PGXC
 		if (fout->isPostgresXL)
 		{
-			/* Add the grammar extension linked to PGXC depending on data got from pgxc_class */
-			if (tbinfo->pgxclocatortype != 'E')
+			/*
+			 * Add table distribution syntax, unless we're dealing with a
+			 * partiion table, in which case the information is derived from
+			 * the parent table.
+			 */
+			if (!tbinfo->ispartition && numParents == 0)
 			{
-				/* N: DISTRIBUTE BY ROUNDROBIN */
-				if (tbinfo->pgxclocatortype == 'N')
+				if (tbinfo->pgxclocatortype != 'E')
 				{
-					appendPQExpBuffer(q, "\nDISTRIBUTE BY ROUNDROBIN");
+					/* N: DISTRIBUTE BY ROUNDROBIN */
+					if (tbinfo->pgxclocatortype == 'N')
+					{
+						appendPQExpBuffer(q, "\nDISTRIBUTE BY ROUNDROBIN");
+					}
+					/* R: DISTRIBUTE BY REPLICATED */
+					else if (tbinfo->pgxclocatortype == 'R')
+					{
+						appendPQExpBuffer(q, "\nDISTRIBUTE BY REPLICATION");
+					}
+					/* H: DISTRIBUTE BY HASH  */
+					else if (tbinfo->pgxclocatortype == 'H')
+					{
+						int hashkey = tbinfo->pgxcattnum;
+						appendPQExpBuffer(q, "\nDISTRIBUTE BY HASH (%s)",
+										  fmtId(tbinfo->attnames[hashkey - 1]));
+					}
+					else if (tbinfo->pgxclocatortype == 'M')
+					{
+						int hashkey = tbinfo->pgxcattnum;
+						appendPQExpBuffer(q, "\nDISTRIBUTE BY MODULO (%s)",
+										  fmtId(tbinfo->attnames[hashkey - 1]));
+					}
 				}
-				/* R: DISTRIBUTE BY REPLICATED */
-				else if (tbinfo->pgxclocatortype == 'R')
+				if (include_nodes &&
+						tbinfo->pgxc_node_names != NULL &&
+						tbinfo->pgxc_node_names[0] != '\0')
 				{
-					appendPQExpBuffer(q, "\nDISTRIBUTE BY REPLICATION");
-				}
-				/* H: DISTRIBUTE BY HASH  */
-				else if (tbinfo->pgxclocatortype == 'H')
-				{
-					int hashkey = tbinfo->pgxcattnum;
-					appendPQExpBuffer(q, "\nDISTRIBUTE BY HASH (%s)",
-									  fmtId(tbinfo->attnames[hashkey - 1]));
-				}
-				else if (tbinfo->pgxclocatortype == 'M')
-				{
-					int hashkey = tbinfo->pgxcattnum;
-					appendPQExpBuffer(q, "\nDISTRIBUTE BY MODULO (%s)",
-									  fmtId(tbinfo->attnames[hashkey - 1]));
+					appendPQExpBuffer(q, "\nTO NODE (%s)", tbinfo->pgxc_node_names);
 				}
 			}
-			if (include_nodes &&
-				tbinfo->pgxc_node_names != NULL &&
-				tbinfo->pgxc_node_names[0] != '\0')
-			{
-				appendPQExpBuffer(q, "\nTO NODE (%s)", tbinfo->pgxc_node_names);
-			}
+
 		}
 #endif
 		/* Dump generic options if any */
@@ -16461,18 +16469,15 @@ dumpSequenceData(Archive *fout, TableDataInfo *tdinfo)
 		 */
 		resetPQExpBuffer(query);
 		appendPQExpBufferStr(query, "SELECT pg_catalog.nextval(");
-		appendStringLiteralAH(query, fmtId(tbinfo->dobj.name), fout);
+		appendStringLiteralAH(query, fmtQualifiedDumpable(tbinfo), fout);
 		appendPQExpBuffer(query, ");\n");
 		res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
 
 		if (PQntuples(res) != 1)
 		{
-			write_msg(NULL, ngettext("query to get nextval of sequence \"%s\" "
-									 "returned %d rows (expected 1)\n",
-										"query to get nextval of sequence \"%s\" "
-									 "returned %d rows (expected 1)\n",
-									 PQntuples(res)),
-					tbinfo->dobj.name, PQntuples(res));
+			write_msg(NULL, "query to get nextval of sequence \"%s\" "
+							"returned %d rows (expected 1)\n",
+							fmtQualifiedDumpable(tbinfo), PQntuples(res));
 			exit_nicely(1);
 		}
 

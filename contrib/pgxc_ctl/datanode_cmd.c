@@ -1149,8 +1149,8 @@ int add_datanodeMaster(char *name, char *host, int port, int pooler, char *dir,
 	/* Now add the master */
 
 	gtmPxyIdx = getEffectiveGtmProxyIdxFromServerName(host);
-	gtmHost = (gtmPxyIdx > 0) ? aval(VAR_gtmProxyServers)[gtmPxyIdx] : sval(VAR_gtmMasterServer);
-	gtmPort = (gtmPxyIdx > 0) ? aval(VAR_gtmProxyPorts)[gtmPxyIdx] : sval(VAR_gtmMasterPort);
+	gtmHost = (gtmPxyIdx >= 0) ? aval(VAR_gtmProxyServers)[gtmPxyIdx] : sval(VAR_gtmMasterServer);
+	gtmPort = (gtmPxyIdx >= 0) ? aval(VAR_gtmProxyPorts)[gtmPxyIdx] : sval(VAR_gtmMasterPort);
 
 	/* initdb */
 	doImmediate(host, NULL, "PGXC_CTL_SILENT=1 initdb -D %s %s %s --nodename %s", dir,
@@ -1487,7 +1487,7 @@ int add_datanodeSlave(char *name, char *host, int port, int pooler, char *dir,
 	doImmediate(host, NULL, "pg_basebackup -p %s -h %s -D %s -X stream %s %s",
 				aval(VAR_datanodePorts)[idx],
 				aval(VAR_datanodeMasterServers)[idx], dir,
-				wal ? "--xlogdir" : "",
+				wal ? "--waldir" : "",
 				wal ? walDir : "");
 	/* Update the slave configuration with hot standby and port */
 	if ((f = pgxc_popen_w(host, "cat >> %s/postgresql.conf", dir)) == NULL)

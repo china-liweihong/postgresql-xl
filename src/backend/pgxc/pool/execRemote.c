@@ -24,6 +24,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/relscan.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "catalog/pgxc_node.h"
 #include "commands/prepare.h"
@@ -44,6 +45,7 @@
 #include "pgxc/poolmgr.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
+#include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -308,8 +310,10 @@ create_tuple_desc(char *msg_body, size_t len)
 		AttrNumber	attnum;
 		char		*attname;
 		char		*typname;
+		char		*typschema;
 		Oid 		oidtypeid;
 		int32 		typemode, typmod;
+		List		*namelist = NIL;
 
 		attnum = (AttrNumber) i;
 
@@ -317,8 +321,14 @@ create_tuple_desc(char *msg_body, size_t len)
 		attname = msg_body;
 		msg_body += strlen(attname) + 1;
 
+		/* type schema name */
+		typschema = msg_body;
+		namelist = lappend(namelist, makeString(typschema));
+		msg_body += strlen(typschema) + 1;
+
 		/* type name */
 		typname = msg_body;
+		namelist = lappend(namelist, makeString(typname));
 		msg_body += strlen(typname) + 1;
 
 		/* table OID, ignored */
@@ -342,7 +352,7 @@ create_tuple_desc(char *msg_body, size_t len)
 		msg_body += 2;
 
 		/* Get the OID type and mode type from typename */
-		parseTypeString(typname, &oidtypeid, NULL, false);
+		parseTypeString(NameListToQuotedString(namelist), &oidtypeid, NULL, false);
 
 		TupleDescInitEntry(result, attnum, attname, oidtypeid, typmod, 0);
 	}
